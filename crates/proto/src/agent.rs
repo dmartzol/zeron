@@ -415,6 +415,10 @@ pub enum AccessMode {
     Supervised,
     /// Apply file changes without asking; ask before anything else.
     AutoAcceptEdits,
+    /// The agent's own auto mode: its classifier (Claude Code) or approvals
+    /// reviewer (Codex) approves safe actions and blocks risky ones, so the
+    /// person is asked only when the agent falls back to asking.
+    Auto,
     /// Run commands and change files without asking. Every run before modes
     /// existed ran this way, so it is the default.
     #[default]
@@ -423,7 +427,16 @@ pub enum AccessMode {
 
 impl AccessMode {
     /// Every mode, least to most trusting (the picker's order).
-    pub const ALL: [AccessMode; 3] = [
+    pub const ALL: [AccessMode; 4] = [
+        AccessMode::Supervised,
+        AccessMode::AutoAcceptEdits,
+        AccessMode::Auto,
+        AccessMode::FullAccess,
+    ];
+
+    /// Every mode but [`AccessMode::Auto`], for an agent that asks before
+    /// acting but has no auto mode of its own.
+    pub const WITHOUT_AUTO: [AccessMode; 3] = [
         AccessMode::Supervised,
         AccessMode::AutoAcceptEdits,
         AccessMode::FullAccess,
@@ -437,6 +450,7 @@ impl AccessMode {
         match self {
             AccessMode::Supervised => "Supervised",
             AccessMode::AutoAcceptEdits => "Auto-accept edits",
+            AccessMode::Auto => "Auto",
             AccessMode::FullAccess => "Full access",
         }
     }
@@ -445,6 +459,7 @@ impl AccessMode {
         match self {
             AccessMode::Supervised => "Ask before commands and file changes.",
             AccessMode::AutoAcceptEdits => "Apply edits, ask before other actions.",
+            AccessMode::Auto => "The agent's auto mode approves safe actions, blocks risky ones.",
             AccessMode::FullAccess => "Run commands and edits without asking.",
         }
     }

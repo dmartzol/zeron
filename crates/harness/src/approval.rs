@@ -20,7 +20,9 @@ pub enum Action {
 pub fn allowed_without_asking(access: AccessMode, action: Action) -> bool {
     match access {
         AccessMode::FullAccess => true,
-        AccessMode::AutoAcceptEdits => action == Action::Edit,
+        // What reaches Zeron in auto mode is what the agent's own check
+        // falls back to asking about; edits stay as auto-accept edits has them.
+        AccessMode::AutoAcceptEdits | AccessMode::Auto => action == Action::Edit,
         AccessMode::Supervised => false,
     }
 }
@@ -96,6 +98,8 @@ mod tests {
         assert!(allowed_without_asking(FullAccess, Action::Other));
         assert!(allowed_without_asking(AutoAcceptEdits, Action::Edit));
         assert!(!allowed_without_asking(AutoAcceptEdits, Action::Other));
+        assert!(allowed_without_asking(Auto, Action::Edit));
+        assert!(!allowed_without_asking(Auto, Action::Other));
         assert!(!allowed_without_asking(Supervised, Action::Edit));
     }
 

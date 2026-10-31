@@ -544,6 +544,56 @@ case "$first" in
   read -r _ || exit 0
   ;;
 
+*scenario:auto-refused*)
+  # Auto mode on a model or account without it, as 2.1.280 does it: launched
+  # with `--permission-mode auto`, the CLI reports `default` and asks about
+  # every tool call. The run falls back to accepting edits, and asks for auto
+  # again once the model changes.
+  mode=none
+  prev=
+  for arg in "$@"; do
+    [ "$prev" = "--permission-mode" ] && mode=$arg
+    prev=$arg
+  done
+  [ "$mode" = auto ] || exit 31
+  emit '{"type":"system","subtype":"status","status":null,"permissionMode":"default","session_id":"sess-ar"}'
+  emit '{"type":"system","subtype":"init","model":"claude-haiku-4-5","tools":[],"cwd":"/tmp","session_id":"sess-ar","permissionMode":"default"}'
+  emit '{"type":"control_request","request_id":"cr-edit","request":{"subtype":"can_use_tool","tool_name":"Edit","input":{"file_path":"/tmp/a.rs","old_string":"a","new_string":"b"}}}'
+  read -r resp || exit 1
+  case "$resp" in *'"request_id":"cr-edit"'*'"behavior":"allow"'*) ;; *) exit 32 ;; esac
+  emit '{"type":"control_request","request_id":"cr-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}'
+  read -r resp || exit 1
+  case "$resp" in *'"request_id":"cr-bash"'*'"behavior":"deny"'*) ;; *) exit 33 ;; esac
+  emit '{"type":"result","subtype":"success","result":"refused","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ar"}'
+  # The next turn asks for the closest mode, not auto again.
+  read -r switch || exit 1
+  case "$switch" in *'"subtype":"set_permission_mode"'*) ;; *) exit 34 ;; esac
+  case "$switch" in *'"mode":"acceptEdits"'*) ;; *) exit 34 ;; esac
+  id=$(printf '%s\n' "$switch" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{\"mode\":\"acceptEdits\"}}}"
+  emit '{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"sess-ar"}'
+  read -r prompt || exit 1
+  case "$prompt" in *'edits meanwhile'*) ;; *) exit 35 ;; esac
+  emit "$prompt"
+  emit '{"type":"result","subtype":"success","result":"accepting","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ar"}'
+  # Another model: auto again, after the model switch.
+  read -r model || exit 1
+  case "$model" in *'"subtype":"set_model"'*) ;; *) exit 36 ;; esac
+  id=$(printf '%s\n' "$model" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{}}}"
+  read -r switch || exit 1
+  case "$switch" in *'"subtype":"set_permission_mode"'*) ;; *) exit 37 ;; esac
+  case "$switch" in *'"mode":"auto"'*) ;; *) exit 37 ;; esac
+  id=$(printf '%s\n' "$switch" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{\"mode\":\"auto\"}}}"
+  emit '{"type":"system","subtype":"status","status":null,"permissionMode":"auto","session_id":"sess-ar"}'
+  read -r prompt || exit 1
+  case "$prompt" in *'on fable'*) ;; *) exit 38 ;; esac
+  emit "$prompt"
+  emit '{"type":"result","subtype":"success","result":"auto","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ar"}'
+  read -r _ || exit 0
+  ;;
+
 *scenario:resume-killed-tasks*)
   # Captured live on 2.1.286: `--resume` of a session whose background tasks
   # died with its previous process. The CLI settles them with two empty
