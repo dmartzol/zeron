@@ -2182,7 +2182,7 @@ async fn plan_mode_sets_the_v2_session_agent() {
 #[test]
 fn access_changes_restart_the_server_and_plan_changes_do_not() {
     let harness = OpencodeHarness::new();
-    assert_eq!(harness.access_modes(), AccessMode::ALL);
+    assert_eq!(harness.access_modes(), AccessMode::WITHOUT_AUTO);
     assert!(harness.supports_plan());
     let request = |access: &str, auto_approve: bool, plan: bool| -> RunRequest {
         serde_json::from_value(json!({

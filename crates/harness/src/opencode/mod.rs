@@ -569,7 +569,7 @@ impl Harness for OpencodeHarness {
     /// opencode raises what they ask about (its defaults allow everything),
     /// and put each of those to the person.
     fn access_modes(&self) -> &[AccessMode] {
-        &AccessMode::ALL
+        &AccessMode::WITHOUT_AUTO
     }
     fn supports_plan(&self) -> bool {
         true
@@ -6124,7 +6124,8 @@ http.createServer((req, res) => {
             match access {
                 // Full access passes the run's config through untouched.
                 AccessMode::FullAccess => assert_eq!(config, json!({"model": "keep"})),
-                AccessMode::AutoAcceptEdits => {
+                // Not offered here; a run that asks for it gets auto-accept edits.
+                AccessMode::AutoAcceptEdits | AccessMode::Auto => {
                     assert_eq!((edit, bash), (&json!("allow"), &json!("ask")))
                 }
                 AccessMode::Supervised => assert_eq!((edit, bash), (&json!("ask"), &json!("ask"))),

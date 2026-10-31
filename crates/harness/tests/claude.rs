@@ -1996,6 +1996,72 @@ async fn plan_and_access_modes_switch_on_the_live_process() {
     assert_eq!(headers, ["Approve plan", "Approve command"]);
 }
 
+/// Auto mode the CLI will not run (an unsupported model, or turned off by
+/// the org): the person is told once, the run accepts edits meanwhile and
+/// asks before commands, and another model tries auto again.
+#[tokio::test]
+async fn refused_auto_mode_falls_back_to_accepting_edits() {
+    use zeron_proto::AccessMode;
+
+    let (controls, steer, asked) = approving(&[]);
+    let mut launch = request("scenario:auto-refused");
+    launch.auto_approve = false;
+    launch.access = AccessMode::Auto;
+    let mut stream = harness()
+        .run(launch.clone(), controls)
+        .await
+        .expect("run starts");
+    /// The next turn's result, and the errors shown before it.
+    async fn turn(
+        stream: &mut futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+        errors: &mut Vec<String>,
+    ) -> String {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("event in time")
+                .expect("stream open")
+                .expect("stream event");
+            match event {
+                AgentEvent::Error { message } => errors.push(message),
+                AgentEvent::Done {
+                    status,
+                    result,
+                    error,
+                    ..
+                } => {
+                    assert_eq!(status, DoneStatus::Completed, "{error:?}");
+                    return result.unwrap_or_default();
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    let mut results = vec![turn(&mut stream, &mut errors).await];
+    steer.send(steer_msg("edits meanwhile")).await.unwrap();
+    results.push(turn(&mut stream, &mut errors).await);
+    let mut fable = launch.clone();
+    fable.model = Some("claude-fable-5".into());
+    let mut switched = steer_msg("on fable");
+    switched.config = Some(Box::new(fable));
+    steer.send(switched).await.unwrap();
+    results.push(turn(&mut stream, &mut errors).await);
+    assert_eq!(results, ["refused", "accepting", "auto"]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("auto mode is not available"),
+        "{errors:?}"
+    );
+    let headers: Vec<_> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|q| q.header.clone())
+        .collect();
+    assert_eq!(headers, ["Approve command"]);
+}
+
 /// "Marked done the moment I sent it": resuming a session whose background
 /// tasks died with its old process, the CLI settles them with empty results
 /// while the new prompt is still queued. Those are not the prompt's end.

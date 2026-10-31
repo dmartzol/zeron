@@ -27,7 +27,9 @@
 //!   modes; auto-accept edits is `"untrusted"` + `workspace-write` (every
 //!   command but codex's known-safe reads is asked, even inside the
 //!   sandbox; file changes are accepted); supervised is `"untrusted"` +
-//!   `read-only`. A title run stays `"never"`
+//!   `read-only`; auto is `"on-request"` + `workspace-write` with
+//!   `approvalsReviewer: "auto_review"`, codex's own reviewer deciding what
+//!   it would ask about. A title run stays `"never"`
 //!   + `read-only`. `item/commandExecution/requestApproval`,
 //!   `item/fileChange/requestApproval` and `item/permissions/requestApproval`
 //!   the mode does not cover round-trip through
@@ -416,13 +418,31 @@ fn run_access(request: &RunRequest) -> AccessMode {
 /// before modes; auto-accept edits writes the workspace and, like
 /// supervised, asks before anything but codex's known-safe reads (under
 /// `"on-request"` a sandboxed `rm -rf` or `git push` would run unasked).
-/// A title run never asks and never writes, whatever its chat's mode.
+/// Auto is codex's own auto mode: `"on-request"` in the workspace sandbox,
+/// with what codex would ask about reviewed by its approvals reviewer
+/// ([`approvals_reviewer`]). A title run never asks and never writes,
+/// whatever its chat's mode.
 fn permissions(access: AccessMode, title_only: bool) -> (&'static str, SandboxLevel) {
     match access {
         _ if title_only => ("never", SandboxLevel::ReadOnly),
         AccessMode::FullAccess => ("never", SandboxLevel::DangerFullAccess),
+        AccessMode::Auto => ("on-request", SandboxLevel::WorkspaceWrite),
         AccessMode::AutoAcceptEdits => ("untrusted", SandboxLevel::WorkspaceWrite),
         AccessMode::Supervised => ("untrusted", SandboxLevel::ReadOnly),
+    }
+}
+
+/// Who answers codex's approval requests: in auto, its `auto_review`
+/// subagent, which approves or denies each one itself; in any other mode
+/// that asks, the person, explicitly, since a configured
+/// `approvals_reviewer` could otherwise hand them to that reviewer. A mode
+/// that never asks names none.
+fn approvals_reviewer(access: AccessMode, title_only: bool) -> Option<&'static str> {
+    match access {
+        _ if title_only => None,
+        AccessMode::FullAccess => None,
+        AccessMode::Auto => Some("auto_review"),
+        AccessMode::AutoAcceptEdits | AccessMode::Supervised => Some("user"),
     }
 }
 
@@ -705,8 +725,9 @@ impl Harness for CodexHarness {
     fn stops_turn_in_place(&self) -> bool {
         true
     }
-    /// Supervised asks before what codex does not know to be safe, and
-    /// auto-accept edits before stepping outside the workspace sandbox.
+    /// Supervised asks before what codex does not know to be safe,
+    /// auto-accept edits before stepping outside the workspace sandbox, and
+    /// auto hands those asks to codex's own approvals reviewer.
     fn access_modes(&self) -> &[AccessMode] {
         &AccessMode::ALL
     }
@@ -1351,12 +1372,10 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
-    // The access mode's approval policy and sandbox (see [`permissions`]).
-    // A mode that asks routes its approvals to the person explicitly: a
-    // configured `approvals_reviewer` could otherwise hand them to an AI
-    // reviewer instead.
+    // The access mode's approval policy and sandbox (see [`permissions`]),
+    // and who reviews its approvals (see [`approvals_reviewer`]).
     let (approval_policy, sandbox) = permissions(run_access(&request), title_only);
-    let asks_person = |live: &RunRequest| !title_only && !run_access(live).is_full_access();
+    let reviewer = |live: &RunRequest| approvals_reviewer(run_access(live), title_only);
     let start_tier = service_tier(&request);
 
     let start_params = {
@@ -1406,8 +1425,8 @@ async fn run_session(session: Session) {
         }
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(sandbox).into());
-        if asks_person(&request) {
-            p.insert("approvalsReviewer".into(), "user".into());
+        if let Some(reviewer) = reviewer(&request) {
+            p.insert("approvalsReviewer".into(), reviewer.into());
         }
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
@@ -1658,8 +1677,8 @@ async fn run_session(session: Session) {
         let (approval_policy, sandbox) = permissions(run_access(live), title_only);
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandboxPolicy".into(), sandbox_policy_value(sandbox));
-        if asks_person(live) {
-            p.insert("approvalsReviewer".into(), "user".into());
+        if let Some(reviewer) = reviewer(live) {
+            p.insert("approvalsReviewer".into(), reviewer.into());
         }
         // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
         // when asked for — without this codex "thinks" in silence for minutes:
@@ -3109,12 +3128,36 @@ mod tests {
             wire(AccessMode::Supervised, false),
             ("untrusted", "read-only", json!({"type": "readOnly"}))
         );
+        assert_eq!(
+            wire(AccessMode::Auto, false),
+            (
+                "on-request",
+                "workspace-write",
+                json!({"type": "workspaceWrite", "networkAccess": true})
+            )
+        );
         for access in AccessMode::ALL {
             assert_eq!(
                 wire(access, true),
                 ("never", "read-only", json!({"type": "readOnly"}))
             );
+            assert_eq!(approvals_reviewer(access, true), None, "{access:?}");
         }
+        // Auto hands codex's asks to its own reviewer; the other modes that
+        // ask keep them for the person, whatever codex is configured with.
+        assert_eq!(
+            approvals_reviewer(AccessMode::Auto, false),
+            Some("auto_review")
+        );
+        assert_eq!(
+            approvals_reviewer(AccessMode::AutoAcceptEdits, false),
+            Some("user")
+        );
+        assert_eq!(
+            approvals_reviewer(AccessMode::Supervised, false),
+            Some("user")
+        );
+        assert_eq!(approvals_reviewer(AccessMode::FullAccess, false), None);
         // `auto_approve` still means full access, whatever the mode says.
         let mut request = run_request(AccessMode::Supervised, false);
         assert_eq!(run_access(&request), AccessMode::Supervised);
@@ -3135,6 +3178,7 @@ mod tests {
         };
         assert_eq!(allowed(AccessMode::FullAccess), [true, true, true]);
         assert_eq!(allowed(AccessMode::AutoAcceptEdits), [true, false, false]);
+        assert_eq!(allowed(AccessMode::Auto), [true, false, false]);
         assert_eq!(allowed(AccessMode::Supervised), [false, false, false]);
     }
 
@@ -3145,6 +3189,7 @@ mod tests {
         for next in [
             run_request(AccessMode::Supervised, false),
             run_request(AccessMode::AutoAcceptEdits, false),
+            run_request(AccessMode::Auto, false),
             run_request(AccessMode::FullAccess, true),
         ] {
             assert!(!harness.same_runtime(&live, &next), "{next:?}");
