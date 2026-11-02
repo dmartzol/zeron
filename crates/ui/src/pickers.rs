@@ -7220,13 +7220,19 @@ mod tests {
         let muse = [Supervised, FullAccess];
         assert_eq!(resolve_access(AutoAcceptEdits, &muse), Supervised);
         assert_eq!(resolve_access(FullAccess, &muse), FullAccess);
+        // An agent without an auto mode: the next mode that asks more.
+        assert_eq!(
+            resolve_access(Auto, &AccessMode::WITHOUT_AUTO),
+            AutoAcceptEdits
+        );
+        assert_eq!(resolve_access(Auto, &muse), Supervised);
         // Only full access offered: nothing safer to fall back to.
         assert_eq!(resolve_access(Supervised, &[FullAccess]), FullAccess);
         // An engine predating modes runs everything as before.
         assert_eq!(resolve_access(Supervised, &[]), FullAccess);
     }
 
-    const ALL_MODES: [AccessMode; 3] = AccessMode::ALL;
+    const ALL_MODES: [AccessMode; 4] = AccessMode::ALL;
 
     struct ModelShortcutHost {
         focus_sub: Option<gpui::Subscription>,

@@ -1281,7 +1281,10 @@ async fn antigravity_models_group_effort_variants_into_one_row() {
 
 #[test]
 fn only_antigravity_offers_access_modes_beyond_full_access() {
-    assert_eq!(AcpHarness::antigravity().access_modes(), AccessMode::ALL);
+    assert_eq!(
+        AcpHarness::antigravity().access_modes(),
+        AccessMode::WITHOUT_AUTO
+    );
     for harness in [
         AcpHarness::grok(),
         AcpHarness::devin(),

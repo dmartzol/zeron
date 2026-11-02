@@ -15,7 +15,11 @@
 //!   (as every run did before modes), auto-accept edits allows the edit
 //!   tools and asks before the rest, supervised asks before each; a yes/no
 //!   question through [`RunControls::request_input`]. `AskUserQuestion`
-//!   round-trips through it too.
+//!   round-trips through it too. Auto is the CLI's own auto mode: its
+//!   classifier approves or blocks each action itself, and only what it
+//!   falls back to asking about reaches us, asked like auto-accept edits. A
+//!   CLI that will not run in auto mode says so by reporting another mode;
+//!   the run then asks it for `acceptEdits` ([`auto_refused`]).
 //! - ACCESS AND PLAN MODES map onto the CLI's `--permission-mode`
 //!   ([`permission_mode`]) and change on the live process with
 //!   `set_permission_mode`. Plan mode ends when the person approves
@@ -237,6 +241,7 @@ fn access_permission_mode(request: &RunRequest) -> &'static str {
     }
     match request.access {
         AccessMode::AutoAcceptEdits => "acceptEdits",
+        AccessMode::Auto => "auto",
         AccessMode::Supervised | AccessMode::FullAccess => "default",
     }
 }
@@ -255,9 +260,29 @@ fn permission_mode(request: &RunRequest) -> &'static str {
 fn strictness(mode: &str) -> u8 {
     match mode {
         "bypassPermissions" => 0,
-        "acceptEdits" => 1,
-        "default" => 2,
-        _ => 3, // plan
+        "auto" => 1,
+        "acceptEdits" => 2,
+        "default" => 3,
+        _ => 4, // plan
+    }
+}
+
+/// The CLI's answer when it starts or stays outside the `auto` it was asked
+/// for: it needs a supported model and can be turned off by the org
+/// (`disableAutoMode`), and the CLI then quietly runs in `default` (verified
+/// live against 2.1.280 with Haiku 4.5). Plan mode is not a refusal: the
+/// CLI is in it while a plan is drafted.
+fn auto_refused(asked: &str, reported: &str) -> bool {
+    asked == "auto" && reported != "auto" && reported != "plan"
+}
+
+/// What the run asks the CLI for once auto mode was refused: the closest
+/// mode it has, which still allows edits unasked and asks before the rest.
+fn without_auto(mode: &'static str, refused: bool) -> &'static str {
+    if refused && mode == "auto" {
+        "acceptEdits"
+    } else {
+        mode
     }
 }
 
@@ -306,6 +331,11 @@ fn approval_question(
 
 /// What a refused approval tells the agent.
 const APPROVAL_DENIED: &str = "The user did not allow this.";
+
+/// What the person reads when the CLI will not run in auto mode.
+const AUTO_REFUSED: &str = "Claude Code's auto mode is not available for this model or account \
+     (it needs a supported model and can be turned off by your organization). \
+     This chat runs as Auto-accept edits until you pick another model.";
 
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
@@ -1257,6 +1287,9 @@ async fn run_session(session: Session) {
     // The permission mode the CLI last reported (`init`, `status`). It
     // leaves plan mode on its own when the plan is approved.
     let mut cli_mode: Option<String> = None;
+    // The CLI would not run in auto mode (see [`auto_refused`]): the run
+    // asks it for auto-accept edits instead, until the model changes.
+    let mut auto_off = false;
     // A turn stop in flight (`TurnControl::stop_turn`): its request id, and
     // once the CLI has answered, how long a turn-ending `result` may still
     // take. The CLI answers a stop between turns without any result — the
@@ -1396,6 +1429,9 @@ async fn run_session(session: Session) {
                         if let Some((what, asked, _)) = pending_controls.remove(&response.request_id) {
                             if let Some(error) = &error {
                                 config_unsure = true;
+                                // Asked again it would refuse again: ask for
+                                // auto-accept edits from now on.
+                                auto_off |= what == "permission mode" && asked == "auto";
                                 if refused.get(what) != Some(&asked) {
                                     refused.insert(what, asked);
                                     if event_tx.send(Ok(AgentEvent::Error {
@@ -1427,6 +1463,15 @@ async fn run_session(session: Session) {
                     }
                     if let Frame::System(system) = &frame {
                         if let Some(mode) = &system.permission_mode {
+                            let switching = pending_controls
+                                .values()
+                                .any(|(what, ..)| *what == "permission mode");
+                            if !auto_off && !switching && auto_refused(permission_mode(&config), mode) {
+                                auto_off = true;
+                                if event_tx.send(Ok(AgentEvent::Error {
+                                    message: AUTO_REFUSED.into(),
+                                })).await.is_err() { break 'main; }
+                            }
                             cli_mode = Some(mode.clone());
                         }
                         match system.subtype.as_str() {
@@ -1440,7 +1485,7 @@ async fn run_session(session: Session) {
                         }
                     }
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, title_only, &config, &request_input, &stdin.tx);
+                        handle_control_request(req, title_only, &config, auto_off, &request_input, &stdin.tx);
                         continue;
                     }
                     // Only the CLI confirms that a prompt joined its
@@ -1611,13 +1656,21 @@ async fn run_session(session: Session) {
                     // the same stdin the CLI reads in order.
                     // A message starting a turn also puts back a plan mode
                     // the CLI left when its last plan was approved.
+                    let mode_of = |config: &RunRequest, auto_off| without_auto(permission_mode(config), auto_off);
                     let mut switch_mode = !turn_open
-                        && cli_mode.as_deref().is_some_and(|mode| mode != permission_mode(&config));
+                        && cli_mode.as_deref().is_some_and(|mode| mode != mode_of(&config, auto_off));
                     if let Some(next) = msg.config {
                         reconfigures += 1;
                         let resend = std::mem::take(&mut config_unsure);
                         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
-                        switch_mode |= resend || permission_mode(&next) != permission_mode(&config);
+                        // Another model may be one auto mode supports.
+                        let retry_auto = auto_off && model_arg(&next) != model_arg(&config);
+                        if retry_auto {
+                            auto_off = false;
+                        }
+                        switch_mode |= resend
+                            || retry_auto
+                            || mode_of(&next, auto_off) != mode_of(&config, auto_off);
                         if resend || model_arg(&next) != model_arg(&config) {
                             let id = format!("zeron_model_{reconfigures}");
                             let model = model_arg(&next);
@@ -1637,7 +1690,7 @@ async fn run_session(session: Session) {
                     if switch_mode {
                         mode_switches += 1;
                         let id = format!("zeron_mode_{mode_switches}");
-                        let mode = permission_mode(&config);
+                        let mode = mode_of(&config, auto_off);
                         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
                         let line = wire::set_permission_mode_line(&id, mode);
                         pending_controls.insert(id, ("permission mode", Value::from(mode), deadline));
@@ -1967,6 +2020,7 @@ fn handle_control_request(
     req: ControlRequestFrame,
     title_only: bool,
     config: &RunRequest,
+    auto_off: bool,
     request_input: &Arc<RequestInputFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) {
@@ -1997,7 +2051,7 @@ fn handle_control_request(
         // Approving the plan leaves plan mode for the run's access mode,
         // not the CLI's `default`.
         let allow = {
-            let after_plan = access_permission_mode(config);
+            let after_plan = without_auto(access_permission_mode(config), auto_off);
             let exit_plan = body.tool_name == "ExitPlanMode";
             move |input: Value| {
                 if exit_plan {
@@ -2272,7 +2326,7 @@ mod access_tests {
     #[test]
     fn modes_launch_with_their_permission_mode() {
         use AccessMode::*;
-        let cases: [(AccessMode, bool, bool, &[&str]); 8] = [
+        let cases: [(AccessMode, bool, bool, &[&str]); 10] = [
             // Full access launches exactly as before modes.
             (
                 FullAccess,
@@ -2303,6 +2357,7 @@ mod access_tests {
                 &["--permission-mode", "acceptEdits"],
             ),
             (Supervised, false, false, &["--permission-mode", "default"]),
+            (Auto, false, false, &["--permission-mode", "auto"]),
             // Plan mode wins; full access keeps the bypass for afterwards
             // without the flag that would override plan mode.
             (
@@ -2316,6 +2371,7 @@ mod access_tests {
                 ],
             ),
             (AutoAcceptEdits, false, true, &["--permission-mode", "plan"]),
+            (Auto, false, true, &["--permission-mode", "plan"]),
             (Supervised, false, true, &["--permission-mode", "plan"]),
         ];
         for (access, auto_approve, plan, expected) in cases {
@@ -2329,6 +2385,25 @@ mod access_tests {
             access_permission_mode(&request(AutoAcceptEdits, false, true)),
             "acceptEdits"
         );
+        assert_eq!(access_permission_mode(&request(Auto, false, true)), "auto");
+    }
+
+    #[test]
+    fn a_cli_outside_auto_mode_falls_back_to_accepting_edits() {
+        // The CLI started in, or moved to, another mode than auto.
+        assert!(auto_refused("auto", "default"));
+        assert!(auto_refused("auto", "acceptEdits"));
+        // In auto, drafting a plan, or never asked for auto: no refusal.
+        assert!(!auto_refused("auto", "auto"));
+        assert!(!auto_refused("auto", "plan"));
+        assert!(!auto_refused("default", "default"));
+        assert!(!auto_refused("plan", "default"));
+        // Once refused, the run asks for the closest mode instead.
+        assert_eq!(without_auto("auto", true), "acceptEdits");
+        assert_eq!(without_auto("auto", false), "auto");
+        for mode in ["default", "acceptEdits", "plan", "bypassPermissions"] {
+            assert_eq!(without_auto(mode, true), mode);
+        }
     }
 
     #[test]
@@ -2349,6 +2424,11 @@ mod access_tests {
         let auto_edits = request(AutoAcceptEdits, false, false);
         assert!(harness.reconfigures_in_place(&supervised, &auto_edits));
         assert!(!harness.reconfigures_in_place(&auto_edits, &supervised));
+        // Auto asks less of the CLI than auto-accept edits, more than bypass.
+        let auto_mode = request(Auto, false, false);
+        assert!(harness.reconfigures_in_place(&auto_edits, &auto_mode));
+        assert!(!harness.reconfigures_in_place(&auto_mode, &auto_edits));
+        assert!(harness.reconfigures_in_place(&request(Auto, false, true), &auto_mode));
         let auto_planning = request(FullAccess, true, true);
         let auto = request(FullAccess, true, false);
         assert!(harness.reconfigures_in_place(&auto_planning, &auto));
@@ -2374,7 +2454,14 @@ mod access_tests {
         }
         for tool in EDIT_TOOLS {
             assert_eq!(ask(tool, &edit, AutoAcceptEdits), None, "{tool}");
+            assert_eq!(ask(tool, &edit, Auto), None, "{tool}");
         }
+        // In auto the classifier decides first; what it still asks about is
+        // the person's.
+        assert_eq!(
+            ask("Bash", &bash, Auto).as_deref(),
+            Some("Claude wants to run `cargo test`. Allow it?")
+        );
         assert_eq!(
             ask("Bash", &bash, AutoAcceptEdits).as_deref(),
             Some("Claude wants to run `cargo test`. Allow it?")
@@ -2400,10 +2487,12 @@ mod access_tests {
             mcp.question,
             "Claude wants to use search (linear) (Find the bug). Allow it?"
         );
-        assert_eq!(
-            ask("ExitPlanMode", &json!({"plan": "p"}), AutoAcceptEdits).as_deref(),
-            Some("Claude wants to start implementing its plan. Allow it?")
-        );
+        for access in [AutoAcceptEdits, Auto] {
+            assert_eq!(
+                ask("ExitPlanMode", &json!({"plan": "p"}), access).as_deref(),
+                Some("Claude wants to start implementing its plan. Allow it?")
+            );
+        }
         let plan = approval_question("ExitPlanMode", None, None, &json!({}), Supervised).unwrap();
         assert_eq!(plan.options, vec![approval::ALLOW, approval::DENY]);
     }

@@ -1203,7 +1203,7 @@ fn antigravity_spec() -> AcpAgentSpec {
         // agy_acp_server's mode select is default / auto_edit / yolo: full
         // access runs `yolo`, the others stay in `default`, which asks, and
         // each permission is decided here. No plan mode is advertised.
-        access_modes: &AccessMode::ALL,
+        access_modes: &AccessMode::WITHOUT_AUTO,
     }
 }
 
